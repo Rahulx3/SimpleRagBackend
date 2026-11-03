@@ -1,55 +1,50 @@
-
 from contextlib import asynccontextmanager
+import logging
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
 
-from rag import (
-    initialize_models,
-    initialize_vector_db,
-    ask_question
+from rag import initialize_models, initialize_vector_db
+from routers.chat import router as chat_router
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
+logger = logging.getLogger("rag_api")
 
 
-# ==========================================
 # APPLICATION STATE
-# ==========================================
-
-app_state = {}
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("Initializing Gemini models and ChromaDB vector database...")
 
     embeddings, llm = initialize_models()
-
     vector_db = initialize_vector_db(embeddings)
 
-    app_state["vector_db"] = vector_db
-    app_state["llm"] = llm
+    app.state.llm = llm
+    app.state.vector_db = vector_db
+
+    logger.info("RAG application initialized successfully and ready for traffic.")
 
     yield
 
-    app_state.clear()
+    app.state.llm = None
+    app.state.vector_db = None
+
+    logger.info("Application shutdown completed.")
 
 
-# ==========================================
 # FASTAPI APP
-# ==========================================
-
 app = FastAPI(
     title="PDF RAG API",
-    description="Ask questions from uploaded PDF knowledge.",
-    version="1.0.0",
+    description="Router-based PDF question answering application",
+    version="2.0.0",
     lifespan=lifespan
 )
 
 
-# ==========================================
-# CORS
-# ==========================================
-
+# CORS CONFIGURATION
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -62,60 +57,14 @@ app.add_middleware(
 )
 
 
-# ==========================================
-# REQUEST MODEL
-# ==========================================
-
-class ChatRequest(BaseModel):
-
-    question: str = Field(
-        min_length=1,
-        max_length=2000
-    )
+# ROUTERS
+app.include_router(chat_router)
 
 
-# ==========================================
-# RESPONSE MODEL
-# ==========================================
-
-class ChatResponse(BaseModel):
-
-    answer: str
-
-
-# ==========================================
-# HEALTH API
-# ==========================================
-
+# HEALTH ENDPOINT
 @app.get("/")
-def home():
-
+def health_check():
     return {
-        "message": "PDF RAG API is running"
+        "message": "PDF RAG API is running",
+        "status": "healthy"
     }
-
-
-# ==========================================
-# CHAT API
-# ==========================================
-
-@app.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest):
-
-    try:
-
-        answer = ask_question(
-            request.question,
-            app_state["vector_db"],
-            app_state["llm"]
-        )
-
-        return ChatResponse(
-            answer=answer
-        )
-
-    except Exception:
-        raise HTTPException(
-            status_code=500,
-            detail="Unable to process your question."
-        )
