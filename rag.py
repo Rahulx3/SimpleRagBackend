@@ -18,18 +18,36 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-PDF_PATH = BASE_DIR / "data" / "sample.pdf"
 CHROMA_PATH = BASE_DIR / "chroma_db"
 COLLECTION_NAME = "pdf_rag"
 
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "models/text-embedding-004")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
 
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 REBUILD_DATABASE = os.getenv("REBUILD_DATABASE", "false").lower() in ("true", "1", "yes")
 
-_COMPLETE_MARKER = CHROMA_PATH / ".ingestion_complete"
+
+def find_pdf_path() -> Path:
+    """
+    Locates the PDF file case-insensitively to prevent Linux/Render FileNotFoundError.
+    """
+    candidates = [
+        BASE_DIR / "data" / "Sample.pdf",
+        BASE_DIR / "data" / "sample.pdf",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+
+    data_dir = BASE_DIR / "data"
+    if data_dir.exists():
+        pdf_files = list(data_dir.glob("*.pdf"))
+        if pdf_files:
+            return pdf_files[0]
+
+    return candidates[0]
 
 
 def initialize_models() -> tuple[GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI]:
@@ -59,16 +77,18 @@ def load_and_split_pdf():
     """
     Loads and splits the PDF into chunks for vector indexing.
     """
-    if not PDF_PATH.exists():
-        raise FileNotFoundError(f"PDF not found at expected path: {PDF_PATH}")
+    pdf_path = find_pdf_path()
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF not found at expected path: {pdf_path}")
 
-    loader = PyPDFLoader(str(PDF_PATH))
+    logger.info("Loading PDF from %s", pdf_path)
+    loader = PyPDFLoader(str(pdf_path))
     documents = loader.load()
 
     # Filter out empty or whitespace-only pages
     documents = [doc for doc in documents if doc.page_content and doc.page_content.strip()]
     if not documents:
-        raise ValueError(f"No readable content extracted from {PDF_PATH}")
+        raise ValueError(f"No readable content extracted from {pdf_path}")
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
@@ -83,8 +103,8 @@ def load_and_split_pdf():
 
 def initialize_vector_db(embeddings: GoogleGenerativeAIEmbeddings) -> Chroma:
     """
-    Initializes or loads the Chroma vector database. Rebuilds if requested,
-    if corrupted, or if there is a dimension mismatch with the active embedding model.
+    Initializes or loads the Chroma vector database.
+    If already populated, reuses the existing vectors without rebuilding.
     """
     if REBUILD_DATABASE and CHROMA_PATH.exists():
         logger.info("REBUILD_DATABASE is active. Removing existing vector database at %s", CHROMA_PATH)
@@ -96,30 +116,13 @@ def initialize_vector_db(embeddings: GoogleGenerativeAIEmbeddings) -> Chroma:
         persist_directory=str(CHROMA_PATH)
     )
 
-    # Check if vector DB is already populated and verify embedding compatibility
+    # If the database already has documents, load immediately
     if vector_db._collection.count() > 0:
-        try:
-            # Probe a search to verify dimension compatibility
-            vector_db.similarity_search("health check", k=1)
-            if not _COMPLETE_MARKER.exists():
-                _COMPLETE_MARKER.write_text("ok", encoding="utf-8")
-            logger.info(
-                "Loaded existing vector database with %s documents.",
-                vector_db._collection.count()
-            )
-            return vector_db
-        except Exception as e:
-            logger.warning(
-                "Existing vector DB is incompatible with the current embedding model (%s). Rebuilding database...",
-                e
-            )
-            if CHROMA_PATH.exists():
-                shutil.rmtree(CHROMA_PATH)
-            vector_db = Chroma(
-                collection_name=COLLECTION_NAME,
-                embedding_function=embeddings,
-                persist_directory=str(CHROMA_PATH)
-            )
+        logger.info(
+            "Loaded existing vector database with %s documents.",
+            vector_db._collection.count()
+        )
+        return vector_db
 
     logger.info("Ingesting document chunks into ChromaDB using %s...", EMBEDDING_MODEL)
     chunks = load_and_split_pdf()
@@ -139,8 +142,5 @@ def initialize_vector_db(embeddings: GoogleGenerativeAIEmbeddings) -> Chroma:
                 logger.warning("Error adding batch. Retrying in %ss (attempt %s/5)...", backoff, attempt + 1)
                 time.sleep(backoff)
 
-    CHROMA_PATH.mkdir(parents=True, exist_ok=True)
-    _COMPLETE_MARKER.write_text("ok", encoding="utf-8")
     logger.info("Vector database ingestion complete with %s total items.", vector_db._collection.count())
-
     return vector_db
