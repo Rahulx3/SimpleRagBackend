@@ -23,7 +23,7 @@ CHROMA_PATH = BASE_DIR / "chroma_db"
 COLLECTION_NAME = "pdf_rag"
 
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "models/embedding-001")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "models/text-embedding-004")
 
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
@@ -83,8 +83,8 @@ def load_and_split_pdf():
 
 def initialize_vector_db(embeddings: GoogleGenerativeAIEmbeddings) -> Chroma:
     """
-    Initializes or loads the Chroma vector database. Rebuilds if requested or if
-    previous ingestion did not complete cleanly.
+    Initializes or loads the Chroma vector database. Rebuilds if requested,
+    if corrupted, or if there is a dimension mismatch with the active embedding model.
     """
     if REBUILD_DATABASE and CHROMA_PATH.exists():
         logger.info("REBUILD_DATABASE is active. Removing existing vector database at %s", CHROMA_PATH)
@@ -96,17 +96,32 @@ def initialize_vector_db(embeddings: GoogleGenerativeAIEmbeddings) -> Chroma:
         persist_directory=str(CHROMA_PATH)
     )
 
-    # Check if vector DB is already populated
+    # Check if vector DB is already populated and verify embedding compatibility
     if vector_db._collection.count() > 0:
-        if not _COMPLETE_MARKER.exists():
-            _COMPLETE_MARKER.write_text("ok", encoding="utf-8")
-        logger.info(
-            "Loaded existing vector database with %s documents.",
-            vector_db._collection.count()
-        )
-        return vector_db
+        try:
+            # Probe a search to verify dimension compatibility
+            vector_db.similarity_search("health check", k=1)
+            if not _COMPLETE_MARKER.exists():
+                _COMPLETE_MARKER.write_text("ok", encoding="utf-8")
+            logger.info(
+                "Loaded existing vector database with %s documents.",
+                vector_db._collection.count()
+            )
+            return vector_db
+        except Exception as e:
+            logger.warning(
+                "Existing vector DB is incompatible with the current embedding model (%s). Rebuilding database...",
+                e
+            )
+            if CHROMA_PATH.exists():
+                shutil.rmtree(CHROMA_PATH)
+            vector_db = Chroma(
+                collection_name=COLLECTION_NAME,
+                embedding_function=embeddings,
+                persist_directory=str(CHROMA_PATH)
+            )
 
-    logger.info("Ingesting document chunks into ChromaDB...")
+    logger.info("Ingesting document chunks into ChromaDB using %s...", EMBEDDING_MODEL)
     chunks = load_and_split_pdf()
     batch_size = 10
 
@@ -124,7 +139,6 @@ def initialize_vector_db(embeddings: GoogleGenerativeAIEmbeddings) -> Chroma:
                 logger.warning("Error adding batch. Retrying in %ss (attempt %s/5)...", backoff, attempt + 1)
                 time.sleep(backoff)
 
-    # Mark ingestion as successfully finished
     CHROMA_PATH.mkdir(parents=True, exist_ok=True)
     _COMPLETE_MARKER.write_text("ok", encoding="utf-8")
     logger.info("Vector database ingestion complete with %s total items.", vector_db._collection.count())
