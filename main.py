@@ -50,6 +50,8 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "https://rag-hazel-six.vercel.app",
+        "https://rag-38x7n0w74-rahul-sajwans-projects.vercel.app",
+        "https://rag-38x7n0w74-rahul-sajwans-projects.vercel.app/",
     ],
     allow_credentials=True,
     allow_methods=["*"],
