@@ -163,13 +163,27 @@ def initialize_vector_db(embeddings: GoogleGenerativeAIEmbeddings) -> Chroma:
         persist_directory=str(CHROMA_PATH)
     )
 
-    # If already populated and source has not changed, reuse existing vectors
-    if vector_db._collection.count() > 0 and not REBUILD_DATABASE and (stored_hash == source_hash or not stored_hash):
+    # Only reuse existing vectors if source hash matches and is non-empty
+    if (
+        vector_db._collection.count() > 0
+        and not REBUILD_DATABASE
+        and stored_hash
+        and stored_hash == source_hash
+    ):
         logger.info(
             "Loaded existing vector database with %s documents.",
             vector_db._collection.count()
         )
         return vector_db
+
+    # Clean stale collection before re-indexing
+    if CHROMA_PATH.exists():
+        shutil.rmtree(CHROMA_PATH)
+    vector_db = Chroma(
+        collection_name=COLLECTION_NAME,
+        embedding_function=embeddings,
+        persist_directory=str(CHROMA_PATH)
+    )
 
     logger.info("Ingesting structured document chunks into ChromaDB using %s...", EMBEDDING_MODEL)
     chunks = load_and_split_documents()
