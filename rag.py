@@ -148,6 +148,7 @@ def initialize_vector_db(embeddings: GoogleGenerativeAIEmbeddings) -> Chroma:
     """
     Initializes or loads the Chroma vector database.
     Automatically re-indexes if source content changes or REBUILD_DATABASE is true.
+    Uses micro-batches and rate-limit backoff to protect Google AI Studio free tier quota.
     """
     source_hash = get_source_hash()
     hash_file = CHROMA_PATH / ".source_hash"
@@ -187,20 +188,28 @@ def initialize_vector_db(embeddings: GoogleGenerativeAIEmbeddings) -> Chroma:
 
     logger.info("Ingesting structured document chunks into ChromaDB using %s...", EMBEDDING_MODEL)
     chunks = load_and_split_documents()
-    batch_size = 10
+    batch_size = 2  # Small micro-batches to stay comfortably within 30,000 tokens/min Free Tier limit
 
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i:i + batch_size]
-        for attempt in range(5):
+        for attempt in range(6):
             try:
                 vector_db.add_documents(batch)
+                time.sleep(2)  # Cooldown between batches
                 break
-            except Exception:
-                if attempt == 4:
-                    logger.exception("Failed to add batch starting at index %s after 5 attempts", i)
+            except Exception as e:
+                err_msg = str(e)
+                if attempt == 5:
+                    logger.exception("Failed to add batch starting at index %s after 6 attempts", i)
                     raise
-                backoff = 5 * (attempt + 1)
-                logger.warning("Error adding batch. Retrying in %ss (attempt %s/5)...", backoff, attempt + 1)
+                # If rate-limited (429 / RESOURCE_EXHAUSTED), wait 25s for free tier quota window to reset
+                backoff = 25 if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg) else 5 * (attempt + 1)
+                logger.warning(
+                    "Rate limit or error adding batch (%s). Waiting %ss for quota recovery (attempt %s/6)...",
+                    err_msg[:120],
+                    backoff,
+                    attempt + 1
+                )
                 time.sleep(backoff)
 
     CHROMA_PATH.mkdir(parents=True, exist_ok=True)
