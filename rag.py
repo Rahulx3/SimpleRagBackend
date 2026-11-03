@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -21,7 +22,7 @@ load_dotenv(BASE_DIR / ".env")
 CHROMA_PATH = BASE_DIR / "chroma_db"
 COLLECTION_NAME = "pdf_rag"
 
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash")
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3.8-flash")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
 
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
@@ -50,6 +51,27 @@ def find_pdf_path() -> Path:
     return candidates[0]
 
 
+def get_source_file() -> Path:
+    """
+    Returns the primary knowledge source. Prefers structured markdown (sample.md)
+    over PDF for significantly higher RAG retrieval accuracy.
+    """
+    md_path = BASE_DIR / "data" / "sample.md"
+    if md_path.exists():
+        return md_path
+    return find_pdf_path()
+
+
+def get_source_hash() -> str:
+    """
+    Calculates MD5 hash of the active source file to detect content updates.
+    """
+    source = get_source_file()
+    if source.exists():
+        return hashlib.md5(source.read_bytes()).hexdigest()
+    return ""
+
+
 def initialize_models() -> tuple[GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI]:
     """
     Initializes Gemini embeddings and LLM.
@@ -75,7 +97,7 @@ def initialize_models() -> tuple[GoogleGenerativeAIEmbeddings, ChatGoogleGenerat
 
 def load_and_split_pdf():
     """
-    Loads and splits the PDF into chunks for vector indexing.
+    Loads and splits PDF using PyPDFLoader.
     """
     pdf_path = find_pdf_path()
     if not pdf_path.exists():
@@ -85,7 +107,6 @@ def load_and_split_pdf():
     loader = PyPDFLoader(str(pdf_path))
     documents = loader.load()
 
-    # Filter out empty or whitespace-only pages
     documents = [doc for doc in documents if doc.page_content and doc.page_content.strip()]
     if not documents:
         raise ValueError(f"No readable content extracted from {pdf_path}")
@@ -97,15 +118,41 @@ def load_and_split_pdf():
     )
 
     chunks = splitter.split_documents(documents)
-    logger.info("Split %s pages into %s chunks", len(documents), len(chunks))
+    logger.info("Split %s PDF pages into %s chunks", len(documents), len(chunks))
     return chunks
+
+
+def load_and_split_documents():
+    """
+    Loads and splits the knowledge source into semantically coherent chunks.
+    If sample.md is present, splits along employee/section boundaries so that
+    entire employee monthly histories stay intact in single chunks.
+    """
+    source = get_source_file()
+    if source.suffix.lower() == ".md":
+        logger.info("Loading structured markdown knowledge from %s", source)
+        content = source.read_text(encoding="utf-8")
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=3200,
+            chunk_overlap=100,
+            separators=["\n---\n\n## ", "\n---\n", "\n## ", "\n\n", "\n"]
+        )
+        chunks = splitter.create_documents([content], metadatas=[{"source": str(source)}])
+        logger.info("Created %s structured chunks from %s", len(chunks), source.name)
+        return chunks
+
+    return load_and_split_pdf()
 
 
 def initialize_vector_db(embeddings: GoogleGenerativeAIEmbeddings) -> Chroma:
     """
     Initializes or loads the Chroma vector database.
-    If already populated, reuses the existing vectors without rebuilding.
+    Automatically re-indexes if source content changes or REBUILD_DATABASE is true.
     """
+    source_hash = get_source_hash()
+    hash_file = CHROMA_PATH / ".source_hash"
+    stored_hash = hash_file.read_text(encoding="utf-8").strip() if hash_file.exists() else ""
+
     if REBUILD_DATABASE and CHROMA_PATH.exists():
         logger.info("REBUILD_DATABASE is active. Removing existing vector database at %s", CHROMA_PATH)
         shutil.rmtree(CHROMA_PATH)
@@ -116,16 +163,16 @@ def initialize_vector_db(embeddings: GoogleGenerativeAIEmbeddings) -> Chroma:
         persist_directory=str(CHROMA_PATH)
     )
 
-    # If the database already has documents, load immediately
-    if vector_db._collection.count() > 0:
+    # If already populated and source has not changed, reuse existing vectors
+    if vector_db._collection.count() > 0 and not REBUILD_DATABASE and (stored_hash == source_hash or not stored_hash):
         logger.info(
             "Loaded existing vector database with %s documents.",
             vector_db._collection.count()
         )
         return vector_db
 
-    logger.info("Ingesting document chunks into ChromaDB using %s...", EMBEDDING_MODEL)
-    chunks = load_and_split_pdf()
+    logger.info("Ingesting structured document chunks into ChromaDB using %s...", EMBEDDING_MODEL)
+    chunks = load_and_split_documents()
     batch_size = 10
 
     for i in range(0, len(chunks), batch_size):
@@ -141,6 +188,10 @@ def initialize_vector_db(embeddings: GoogleGenerativeAIEmbeddings) -> Chroma:
                 backoff = 5 * (attempt + 1)
                 logger.warning("Error adding batch. Retrying in %ss (attempt %s/5)...", backoff, attempt + 1)
                 time.sleep(backoff)
+
+    CHROMA_PATH.mkdir(parents=True, exist_ok=True)
+    if source_hash:
+        hash_file.write_text(source_hash, encoding="utf-8")
 
     logger.info("Vector database ingestion complete with %s total items.", vector_db._collection.count())
     return vector_db
